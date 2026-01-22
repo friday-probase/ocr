@@ -1,0 +1,3 @@
+[33mChecking connectivity to the model hosters, this may take a while. To bypass this check, set `DISABLE_MODEL_SOURCE_CHECK` to `True`.[0m
+INFO:     Will watch for changes in these directories: ['/home/friday/Documents/projects/work/ocr_ai_service']
+ERROR:    [Errno 98] Address already in use

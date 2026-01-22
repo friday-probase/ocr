@@ -12,14 +12,60 @@ class DocumentClassifier:
     def __init__(self):
         self.classifier = None
         self.document_types = {
-            "payslip": ["payslip", "salary", "pay", "employee", "income"],
-            "id_document": ["id", "identification", "national", "passport"],
-            "contract": ["contract", "agreement", "terms", "signature"],
-            "invoice": ["invoice", "bill", "amount", "due", "payment"],
-            "bank_statement": ["bank", "statement", "account", "balance", "transaction"],
-            "receipt": ["receipt", "proof", "payment", "cash"],
-            "certificate": ["certificate", "award", "achievement", "completion"],
-            "application_form": ["application", "form", "apply", "request"]
+            "payslip": [
+                "payslip", "salary", "pay", "employee", "income", "net pay", "gross pay", 
+                "deduction", "tax", "basic salary", "allowance", "benefits", "employer", 
+                "employee no", "position", "department", "pay period", "hours worked",
+                # Zambian-specific keywords
+                "e-payslip", "government of the republic of zambia", "sal/scale",
+                "taxable income", "leave accrued", "napsa", "pension life", "bayport",
+                "accumulation", "payment amount", "deduction amount", "paye"
+            ],
+            "id_document": [
+                "id", "identification", "national", "passport", "driver's license", "license", 
+                "birth certificate", "surname", "given name", "address", "dob", "date of birth", 
+                "issue date", "expiry date", "issuing authority", "photo", "signature"
+            ],
+            "contract": [
+                "contract", "agreement", "terms", "signature", "party", "effective date", 
+                "termination", "compensation", "obligation", "clause", "article", "signatory", 
+                "witness", "consideration", "mutual", "binding", "performance"
+            ],
+            "invoice": [
+                "invoice", "bill", "amount", "due", "payment", "invoice no", "invoice number", 
+                "customer", "vendor", "item", "quantity", "rate", "subtotal", "total", 
+                "tax", "vat", "gst", "due date", "reference", "po number", "purchase order"
+            ],
+            "bank_statement": [
+                "bank", "statement", "account", "balance", "transaction", "debit", "credit", 
+                "date", "description", "opening balance", "closing balance", "period", 
+                "branch", "account holder", "acc no", "reference", "cheque", "withdrawal", "deposit"
+            ],
+            "receipt": [
+                "receipt", "proof", "payment", "cash", "received", "paid", "amount", "for", 
+                "by", "on", "acknowledged", "sold", "bought", "purchased", "transaction", 
+                "ref no", "reference", "thank you", "store", "business", "customer copy"
+            ],
+            "certificate": [
+                "certificate", "award", "achievement", "completion", "certified", "presented", 
+                "granted", "degree", "diploma", "qualification", "conferred", "awarded", 
+                "participant", "course", "training", "study", "excellence", "merit"
+            ],
+            "application_form": [
+                "application", "form", "apply", "request", "personal details", "contact", 
+                "address", "phone", "email", "submit", "required", "fill", "complete", 
+                "signature", "date", "attachments", "supporting documents", "fee"
+            ],
+            "medical_record": [
+                "medical", "record", "patient", "doctor", "hospital", "clinic", "treatment", 
+                "diagnosis", "prescription", "medication", "appointment", "consultation", 
+                "lab", "test", "report", "history", "symptoms", "condition", "medicine"
+            ],
+            "academic_transcript": [
+                "transcript", "academic", "grade", "course", "credit", "gpa", "semester", 
+                "year", "institution", "student", "number", "major", "minor", "degree", 
+                "graduation", "cumulative", "standing", "credits", "subject", "marks"
+            ]
         }
     
     async def initialize(self):
@@ -62,25 +108,80 @@ class DocumentClassifier:
             return await self._classify_with_keywords(image_bytes)
     
     async def _classify_with_ai(self, image: Image.Image) -> tuple:
-        """Use AI model for classification"""
+        """Use AI model for classification with document-specific logic"""
         try:
-            # This would need custom training for document types
-            # For now, use generic classification as fallback
-            results = self.classifier(image)
+            # Preprocess image for better classification
+            processed_image = self._preprocess_image_for_classification(image)
             
-            # Map generic labels to document types
-            top_label = results[0]['label'].lower()
-            confidence = results[0]['score']
+            # Use the Vision Transformer model for classification
+            results = self.classifier(processed_image)
             
-            doc_type = self._map_label_to_document_type(top_label)
+            # Analyze the top results to determine document type
+            doc_type = "unknown"
+            confidence = 0.0
+            
+            # Look at top 3 predictions to make a more informed decision
+            top_results = results[:3] if len(results) >= 3 else results
+            
+            for result in top_results:
+                label = result['label'].lower()
+                score = result['score']
+                
+                # Check if this label maps to a known document type
+                mapped_type = self._map_label_to_document_type(label)
+                if mapped_type != "unknown":
+                    doc_type = mapped_type
+                    confidence = score
+                    break
+                elif score > confidence:
+                    # If no direct mapping, use the highest confidence as fallback
+                    confidence = score
+            
+            # If we couldn't map to a specific type, use text analysis as backup
+            if doc_type == "unknown" and confidence < 0.7:
+                # Convert image to text and analyze
+                import pytesseract
+                import numpy as np
+                from PIL import Image
+                import io
+                
+                # Convert PIL image to numpy array
+                img_array = np.array(image)
+                if len(img_array.shape) == 3:
+                    img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                else:
+                    img_gray = img_array
+                
+                # Extract text
+                text = pytesseract.image_to_string(img_gray).lower()
+                
+                # Determine type based on text content
+                for doc_type_key, keywords in self.document_types.items():
+                    keyword_count = sum(1 for keyword in keywords if keyword in text)
+                    if keyword_count > 0:
+                        doc_type = doc_type_key
+                        confidence = min(0.6, confidence + 0.1 * keyword_count)  # Moderate confidence
+                        break
+            
             return doc_type, confidence
             
         except Exception as e:
             print(f"AI classification failed: {e}")
             return "unknown", 0.0
     
+    def _preprocess_image_for_classification(self, image: Image.Image) -> Image.Image:
+        """Preprocess image specifically for AI classification"""
+        # Ensure image is in RGB mode
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Resize to the expected input size for ViT model (typically 224x224)
+        image = image.resize((224, 224), Image.Resampling.LANCZOS)
+        
+        return image
+    
     async def _classify_with_keywords(self, image_bytes: bytes) -> DocumentType:
-        """Classify using OCR + keyword analysis"""
+        """Classify using OCR + keyword analysis with improved scoring"""
         try:
             import pytesseract
             
@@ -91,22 +192,61 @@ class DocumentClassifier:
             # Extract text for keyword analysis
             text = pytesseract.image_to_string(image_cv).lower()
             
-            # Score each document type based on keyword matches
+            # Score each document type based on keyword matches with weighted scoring
             scores = {}
             for doc_type, keywords in self.document_types.items():
-                score = sum(1 for keyword in keywords if keyword in text)
+                # Count exact matches
+                exact_matches = sum(1 for keyword in keywords if keyword in text)
+                
+                # Count partial matches (for variations of terms)
+                partial_matches = 0
+                for keyword in keywords:
+                    # Check for variations like plural forms or different endings
+                    variations = [keyword, keyword + 's', keyword + 'es', keyword + 'ed', keyword + 'ing']
+                    for var in variations:
+                        if var in text and var != keyword:  # Avoid double counting
+                            partial_matches += 0.5  # Lower weight for partial matches
+                
+                # Calculate weighted score
                 total_keywords = len(keywords)
-                scores[doc_type] = score / total_keywords if total_keywords > 0 else 0
+                score = (exact_matches + partial_matches) / total_keywords if total_keywords > 0 else 0
+                
+                # Boost score if key terms are found
+                key_terms = ['payslip', 'invoice', 'contract', 'receipt', 'statement', 'certificate', 'id', 'passport']
+                if any(term in text for term in key_terms):
+                    score *= 1.2  # Boost if key terms are found
+                
+                # Penalize if conflicting terms are found
+                conflicting_terms = ['advertisement', 'notice', 'notification', 'announcement']
+                if any(term in text for term in conflicting_terms):
+                    score *= 0.5  # Reduce score if conflicting terms found
+                
+                scores[doc_type] = min(score, 1.0)  # Cap at 1.0
             
             # Get the best match
-            best_type = max(scores, key=scores.get)
-            confidence = scores[best_type]
-            
-            return DocumentType(
-                type=best_type if confidence > 0.1 else "unknown",
-                confidence=min(confidence * 2, 0.95),  # Boost confidence but cap at 95%
-                description=self._get_type_description(best_type)
-            )
+            if scores:
+                best_type = max(scores, key=scores.get)
+                confidence = scores[best_type]
+                
+                # Adjust confidence based on the gap between first and second best
+                sorted_scores = sorted(scores.values(), reverse=True)
+                if len(sorted_scores) > 1:
+                    gap = sorted_scores[0] - sorted_scores[1]
+                    # Increase confidence if there's a clear winner
+                    if gap > 0.1:
+                        confidence = min(confidence + 0.1, 0.95)
+                
+                return DocumentType(
+                    type=best_type if confidence > 0.05 else "unknown",  # Lower threshold
+                    confidence=min(confidence, 0.95),  # Cap at 95%
+                    description=self._get_type_description(best_type)
+                )
+            else:
+                return DocumentType(
+                    type="unknown",
+                    confidence=0.0,
+                    description="Unable to classify document"
+                )
             
         except Exception as e:
             print(f"Keyword classification failed: {e}")

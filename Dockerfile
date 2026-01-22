@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install system dependencies
+# Install system dependencies for OCR and ML
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -11,12 +11,23 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender-dev \
     libgomp1 \
+    libgthread-2.0-0 \
+    libgtk2.0-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    poppler-utils \
     wget \
     curl \
     pkg-config \
     python3-dev \
     build-essential \
+    libffi-dev \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch with CUDA support (if GPU available)
+RUN pip install torch==2.1.0+cpu torchvision==0.16.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
 
 # Set working directory
 WORKDIR /app
@@ -25,8 +36,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create uploads directory
-RUN mkdir -p /app/uploads /app/temp
+# Create necessary directories
+RUN mkdir -p /app/uploads /app/temp /app/models
 
 # Copy application code
 COPY . .
