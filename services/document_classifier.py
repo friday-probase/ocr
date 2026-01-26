@@ -230,7 +230,7 @@ class DocumentClassifier:
                 
                 # Adjust confidence based on the gap between first and second best
                 sorted_scores = sorted(scores.values(), reverse=True)
-                if len(sorted_scores) > 1:
+                if len(sorted_scores) > 1: 
                     gap = sorted_scores[0] - sorted_scores[1]
                     # Increase confidence if there's a clear winner
                     if gap > 0.1:

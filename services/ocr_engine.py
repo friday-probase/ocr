@@ -466,7 +466,39 @@ class OCREngine:
         elif doc_type == "invoice":
             structured_data = await self._extract_invoice_data(text)
         else:
-            structured_data = {"raw_text": text}
+            # For unknown types, try to detect payslip from text content
+            # This helps when classification fails but text clearly indicates a payslip
+            text_lower = text.lower()
+            payslip_keywords = [
+                'net pay', 'gross pay', 'basic salary', 'payslip', 'employee no',
+                'paye', 'napsa', 'deduction', 'allowance', 'e-payslip',
+                'government of the republic of zambia', 'zambia army', 'zambia development',
+                'total earnings', 'total deductions', 'basic pay', 'transport allowance',
+                'housing allowance', 'lunch allowance', 'emp.', 'employee'
+            ]
+            
+            # Also check for corrupted OCR versions of keywords
+            corrupted_keywords = [
+                'tote', 'tota', 'tota1', 't0tal',  # "total" OCR errors
+                'neh', 'net', 'n3t',  # "net" OCR errors
+                'pay', 'p4y', 'p@y',  # "pay" OCR errors
+                'emp', '3mp',  # "emp" OCR errors
+            ]
+            
+            # Count keyword matches (exact and corrupted)
+            keyword_count = sum(1 for keyword in payslip_keywords if keyword in text_lower)
+            corrupted_count = sum(1 for keyword in corrupted_keywords if keyword in text_lower)
+            
+            # If we find multiple payslip keywords (including corrupted ones), try payslip extraction
+            total_keyword_count = keyword_count + (corrupted_count // 2)  # Weight corrupted matches less
+            if total_keyword_count >= 1:  # Lower threshold - even 1 keyword suggests payslip
+                structured_data = await self._extract_payslip_data(text)
+                if not structured_data or 'net_pay' not in structured_data:
+                    # If extraction didn't find net_pay, still keep raw_text as fallback
+                    structured_data = structured_data or {}
+                    structured_data['raw_text'] = text
+            else:
+                structured_data = {"raw_text": text}
         
         return structured_data
     
@@ -591,19 +623,36 @@ class OCREngine:
         
         # Fallback net pay extraction if not found with Zambian format
         if 'net_pay' not in data:
+            # Enhanced patterns with flexible amount formats
             net_pay_patterns = [
-                r'(?i)net\s+(?:pay|salary|earnings|amount)[\s:]*[:\s\$€£¥K]*([0-9,]+\.?[0-9]*)',
-                r'(?i)take\s+home\s+(?:pay|amount)[:\s\$€£¥K]*([0-9,]+\.?[0-9]*)',
-                r'(?i)net\s+(?:amount|total)[:\s\$€£¥K]*([0-9,]+\.?[0-9]*)',
-                r'(?i)(?:total\s+)?net[:\s\$€£¥K]+([0-9,]+\.?[0-9]*)',
+                r'(?i)net\s+(?:pay|salary|earnings|amount)[\s:]*[:\s\$€£¥K]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',
+                r'(?i)take\s+home\s+(?:pay|amount)[:\s\$€£¥K]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',
+                r'(?i)net\s+(?:amount|total)[:\s\$€£¥K]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',
+                r'(?i)(?:total\s+)?net[:\s\$€£¥K]+([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',
+                r'(?i)net\s+([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # Simple "NET amount"
+                r'(?i)\bnet\b\s+([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # Word boundary NET
+                r'(?i)payable\s*[:\-]?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # "PAYABLE: amount"
+                r'(?i)amount\s+payable\s*[:\-]?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',
+                r'(?i)net\s+pay\s*[:\-]?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NET PAY: amount
             ]
             for pattern in net_pay_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
+                matches = list(re.finditer(pattern, text, re.IGNORECASE))
+                for match in matches:
                     amount = match.group(1).strip()
-                    if self._is_valid_amount(amount):
+                    # Clean amount for validation
+                    cleaned = amount.replace(',', '').replace('.', '', 1) if '.' in amount else amount.replace(',', '')
+                    if self._is_valid_amount(cleaned):
                         data['net_pay'] = self._normalize_amount(amount)
                         break
+                if 'net_pay' in data:
+                    break
+        
+        # Ultimate fallback: Use positional heuristics to find net pay
+        # When OCR quality is poor and patterns don't match, use document structure
+        if 'net_pay' not in data:
+            net_pay = self._extract_netpay_positional_heuristics(text, lines)
+            if net_pay:
+                data['net_pay'] = net_pay
         
         # Pay period/dates
         date_patterns = [
@@ -628,64 +677,186 @@ class OCREngine:
         """
         Extract net pay specifically for Zambian government e-payslip format.
         Handles formats where 'NET PAY' is on its own line with the amount below.
+        Enhanced with multiple fallback strategies for different payslip formats.
         """
         import re
+        
+        # Enhanced amount pattern - handles various formats:
+        # - 3,990.00 (with comma, 2 decimals)
+        # - 3990.00 (no comma, 2 decimals)
+        # - 3,990 (with comma, no decimals)
+        # - 8689.21 (no comma, 2 decimals)
+        # - 10,222.88 (with comma, 2 decimals)
+        amount_patterns = [
+            r'([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # Flexible: 3,990.00, 3990.00, 10,222.88
+            r'([0-9,]+\.[0-9]{1,2})',  # Standard: comma-separated with decimals
+            r'([0-9]+\.[0-9]{1,2})',  # No comma: 3990.00
+            r'([0-9]{1,3}(?:[,\.][0-9]{3})+)',  # Large numbers: 10,222 or 10222
+        ]
+        
+        def extract_amount_from_text(text_snippet: str) -> Optional[str]:
+            """Extract the first valid amount from text snippet"""
+            for pattern in amount_patterns:
+                matches = re.findall(pattern, text_snippet)
+                for match in matches:
+                    if not match:
+                        continue
+                    # Clean the match - handle both comma and period as thousands separator
+                    # First, determine if period is decimal or thousands separator
+                    if '.' in match and ',' in match:
+                        # Format like 3,990.00 - comma is thousands, period is decimal
+                        cleaned = match.replace(',', '')
+                    elif '.' in match:
+                        # Could be 3990.00 or 3.990 (European format)
+                        # Check if it looks like decimal (has 1-2 digits after period)
+                        parts = match.split('.')
+                        if len(parts) == 2 and len(parts[1]) <= 2:
+                            # Decimal format: 3990.00
+                            cleaned = match.replace(',', '')
+                        else:
+                            # Thousands separator: 3.990
+                            cleaned = match.replace('.', '').replace(',', '')
+                    elif ',' in match:
+                        # Could be 3,990 (thousands) or 3,99 (decimal in some locales)
+                        # For payslips, comma is usually thousands separator
+                        cleaned = match.replace(',', '')
+                    else:
+                        cleaned = match
+                    
+                    # Try to validate
+                    try:
+                        test_val = float(cleaned)
+                        if self._is_valid_amount(cleaned):
+                            # Return in original format if it has proper decimal places
+                            if '.' in match and len(match.split('.')[-1]) <= 2:
+                                return match
+                            elif '.' not in match and len(cleaned) > 2:
+                                # Add decimal places
+                                return f"{int(test_val)}.{int((test_val - int(test_val)) * 100):02d}"
+                            else:
+                                return match
+                    except (ValueError, AttributeError):
+                        continue
+            return None
         
         # Method 1: Line-by-line detection for "NET PAY" followed by amount
         for i, line in enumerate(lines):
             line_clean = line.strip().upper()
+            line_original = line.strip()
             
-            # Check if this line contains "NET PAY"
-            if 'NET PAY' in line_clean or 'NET-PAY' in line_clean or 'NETPAY' in line_clean:
+            # Check if this line contains "NET PAY" in various forms
+            if any(keyword in line_clean for keyword in ['NET PAY', 'NET-PAY', 'NETPAY', 'NET PAY:', 'NET-PAY:']):
                 # Try to extract amount from the same line first
-                amount_match = re.search(r'([0-9,]+\.[0-9]{2})', line)
-                if amount_match:
-                    amount = amount_match.group(1)
-                    if self._is_valid_amount(amount):
-                        return self._normalize_amount(amount)
+                amount = extract_amount_from_text(line_original)
+                if amount:
+                    return self._normalize_amount(amount)
                 
-                # Check the next line for the amount
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    amount_match = re.search(r'([0-9,]+\.[0-9]{2})', next_line)
-                    if amount_match:
-                        amount = amount_match.group(1)
-                        if self._is_valid_amount(amount):
+                # Check the next 2 lines for the amount (sometimes it's 2 lines away)
+                for offset in [1, 2]:
+                    if i + offset < len(lines):
+                        next_line = lines[i + offset].strip()
+                        amount = extract_amount_from_text(next_line)
+                        if amount:
                             return self._normalize_amount(amount)
         
-        # Method 2: Pattern matching for multi-line format
+        # Method 2: Handle "NET" without "PAY" (e.g., ZAMBIA ARMY format: "NET 8,689.21")
+        for i, line in enumerate(lines):
+            line_upper = line.strip().upper()
+            line_original = line.strip()
+            
+            # Check for "NET" followed by amount on same line (common in army payslips)
+            net_match = re.search(r'(?i)\bNET\b', line_upper)
+            if net_match and 'PAY' not in line_upper:
+                # Extract amount from same line after "NET"
+                net_pos = net_match.end()
+                text_after_net = line_original[net_pos:].strip()
+                amount = extract_amount_from_text(text_after_net)
+                if amount:
+                    return self._normalize_amount(amount)
+                
+                # Also check if standalone "NET" on its own line
+                if re.match(r'^NET\s*$', line_upper):
+                    # Check next 2 lines
+                    for offset in [1, 2]:
+                        if i + offset < len(lines):
+                            next_line = lines[i + offset].strip()
+                            amount = extract_amount_from_text(next_line)
+                            if amount:
+                                return self._normalize_amount(amount)
+        
+        # Method 3: Enhanced pattern matching for multi-line format
         multiline_patterns = [
-            r'(?i)NET\s+PAY\s*\n+\s*([0-9,]+\.[0-9]{2})',
-            r'(?i)NET\s+PAY\s+[^\d]*([0-9,]+\.[0-9]{2})',
-            r'(?i)NETPAY\s*[:\-]?\s*([0-9,]+\.[0-9]{2})',
+            r'(?i)NET\s+PAY\s*[:\-]?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NET PAY: 3,990.00
+            r'(?i)NET\s+PAY\s*\n+\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NET PAY\n3,990.00
+            r'(?i)NET\s+PAY\s+[^\d]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NET PAY ... 3,990.00
+            r'(?i)NETPAY\s*[:\-]?\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NETPAY: 3,990.00
+            r'(?i)NET\s*\n+\s*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NET\n3,990.00
+            r'(?i)NET\s+([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NET 3,990.00 (same line)
+            r'(?i)\bNET\b\s+([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # NET 8,689.21
         ]
         
         for pattern in multiline_patterns:
-            match = re.search(pattern, text, re.MULTILINE)
+            matches = list(re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE))
+            for match in matches:
+                amount_str = match.group(1)
+                # Clean and validate
+                cleaned = amount_str.replace(',', '').replace('.', '', 1) if '.' in amount_str else amount_str.replace(',', '')
+                if self._is_valid_amount(cleaned):
+                    return self._normalize_amount(amount_str)
+        
+        # Method 4: Table footer detection - look for TOTALS row and NET PAY
+        # Zambian payslips often have: TOTALS <payment_amount> <deduction_amount> then NET PAY <amount>
+        totals_patterns = [
+            r'(?i)TOTALS?\s+[^\d]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)\s+[^\d]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)\s*\n\s*NET\s+PAY\s+[^\d]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',
+            r'(?i)TOTALS?\s+[^\d]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)\s*\n\s*NET\s+PAY\s+[^\d]*([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',
+        ]
+        
+        for pattern in totals_patterns:
+            match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
             if match:
-                amount = match.group(1)
-                if self._is_valid_amount(amount):
+                # Get the last group (net pay amount)
+                amount_str = match.group(match.lastindex)
+                cleaned = amount_str.replace(',', '').replace('.', '', 1) if '.' in amount_str else amount_str.replace(',', '')
+                if self._is_valid_amount(cleaned):
+                    return self._normalize_amount(amount_str)
+        
+        # Method 5: Find amounts near "NET PAY" keywords (expanded search window)
+        net_pay_keywords = ['NET PAY', 'NET-PAY', 'NETPAY', 'NET']
+        for keyword in net_pay_keywords:
+            # Search for keyword and extract context (up to 150 chars after)
+            pattern = rf'(?i)({re.escape(keyword)}.{{0,150}})'
+            matches = list(re.finditer(pattern, text, re.DOTALL | re.IGNORECASE))
+            for match in matches:
+                section = match.group(1)
+                # Try to find amount in this section
+                amount = extract_amount_from_text(section)
+                if amount:
                     return self._normalize_amount(amount)
         
-        # Method 3: Table footer detection - look for TOTALS row and NET PAY
-        # Zambian payslips often have: TOTALS <payment_amount> <deduction_amount> then NET PAY <amount>
-        totals_pattern = r'(?i)TOTALS?\s+[\-\s]*([0-9,]+\.?[0-9]*)\s+[\-\s]*([0-9,]+\.?[0-9]*)\s*[\-\s]*\n\s*NET\s+PAY\s+[\-\s]*([0-9,]+\.?[0-9]*)'
-        match = re.search(totals_pattern, text, re.MULTILINE)
-        if match:
-            amount = match.group(3)
-            if self._is_valid_amount(amount):
-                return self._normalize_amount(amount)
-        
-        # Method 4: Find the last occurrence of a reasonable payslip amount near NET PAY
-        net_pay_section = re.search(r'(?i)(NET\s+PAY.{0,100})', text, re.DOTALL)
-        if net_pay_section:
-            section = net_pay_section.group(1)
-            amounts = re.findall(r'([0-9,]+\.[0-9]{2})', section)
-            if amounts:
-                # Return the first amount found in the NET PAY section
-                for amount in amounts:
-                    if self._is_valid_amount(amount):
-                        return self._normalize_amount(amount)
+        # Method 6: Fallback - Find largest amount in bottom 30% of document (where net pay usually appears)
+        # This helps when OCR misses the "NET PAY" label
+        if len(lines) > 4:
+            bottom_percent = max(5, len(lines) // 3)  # Bottom 33% or at least 5 lines
+            bottom_lines = lines[-bottom_percent:]
+            bottom_text = '\n'.join(bottom_lines)
+            
+            # Extract all amounts from bottom section
+            all_amounts = []
+            for pattern in amount_patterns:
+                matches = re.findall(pattern, bottom_text)
+                for match in matches:
+                    cleaned = match.replace(',', '').replace('.', '', 1) if '.' in match else match.replace(',', '')
+                    if self._is_valid_amount(cleaned):
+                        try:
+                            value = float(cleaned)
+                            all_amounts.append((value, match))
+                        except:
+                            continue
+            
+            if all_amounts:
+                # Sort by value and return the largest (net pay is usually the largest in bottom section)
+                all_amounts.sort(key=lambda x: x[0], reverse=True)
+                return self._normalize_amount(all_amounts[0][1])
         
         return None
     
@@ -698,6 +869,121 @@ class OCREngine:
             return 0 < value < 10000000
         except (ValueError, AttributeError):
             return False
+    
+    def _extract_netpay_positional_heuristics(self, text: str, lines: List[str]) -> Optional[str]:
+        """
+        Use positional heuristics to extract net pay when OCR quality is poor.
+        Net pay is typically the largest amount in the bottom section of the document.
+        """
+        import re
+        
+        # Enhanced amount patterns to handle poor OCR quality
+        amount_patterns = [
+            r'([0-9]{1,3}(?:[,\.][0-9]{3})*(?:\.[0-9]{1,2})?)',  # Standard format
+            r'([0-9,]+\.[0-9]{1,2})',  # With comma thousands
+            r'([0-9]+\.[0-9]{1,2})',  # Without comma
+            r'([0-9]{3,}(?:\.[0-9]{1,2})?)',  # Large numbers without separators
+        ]
+        
+        # Strategy 1: Find all monetary amounts in the text using multiple patterns
+        all_amounts = []
+        for pattern in amount_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                if match:
+                    cleaned = match.replace(',', '').replace('.', '', 1) if '.' in match else match.replace(',', '')
+                    if self._is_valid_amount(cleaned):
+                        try:
+                            value = float(cleaned)
+                            all_amounts.append((value, match))
+                        except:
+                            continue
+        
+        if not all_amounts:
+            return None
+        
+        # Strategy 2: Look for amounts near "TOTAL" keywords (even with OCR errors)
+        # Net pay often appears after "Total Deductions" or "Total Earnings"
+        total_keywords = ['total', 'tote', 'tota', 'tota1', 't0tal', 't0tals']  # Common OCR errors
+        for keyword in total_keywords:
+            # Find positions of total keywords
+            pattern = rf'(?i){re.escape(keyword)}'
+            for match in re.finditer(pattern, text):
+                # Look for amounts in the 200 characters after "total"
+                context = text[match.end():match.end()+200]
+                context_amounts = []
+                for amt_pattern in amount_patterns:
+                    amt_matches = re.findall(amt_pattern, context)
+                    for amt_match in amt_matches:
+                        cleaned = amt_match.replace(',', '').replace('.', '', 1) if '.' in amt_match else amt_match.replace(',', '')
+                        if self._is_valid_amount(cleaned):
+                            try:
+                                value = float(cleaned)
+                                context_amounts.append((value, amt_match))
+                            except:
+                                continue
+                
+                if context_amounts:
+                    # Return the first reasonable amount after "total"
+                    context_amounts.sort(key=lambda x: x[0], reverse=True)
+                    return self._normalize_amount(context_amounts[0][1])
+        
+        # Strategy 3: Find the amount that appears in the bottom section
+        # Net pay is usually in the bottom 30% of the document
+        if len(lines) > 4:
+            bottom_percent = max(5, len(lines) // 3)
+            bottom_lines = lines[-bottom_percent:]
+            bottom_text = '\n'.join(bottom_lines)
+            
+            bottom_amounts = []
+            for pattern in amount_patterns:
+                matches = re.findall(pattern, bottom_text)
+                for match in matches:
+                    cleaned = match.replace(',', '').replace('.', '', 1) if '.' in match else match.replace(',', '')
+                    if self._is_valid_amount(cleaned):
+                        try:
+                            value = float(cleaned)
+                            bottom_amounts.append((value, match))
+                        except:
+                            continue
+            
+            if bottom_amounts:
+                # Return the largest amount in the bottom section
+                bottom_amounts.sort(key=lambda x: x[0], reverse=True)
+                return self._normalize_amount(bottom_amounts[0][1])
+        
+        # Strategy 4: Return a reasonable amount from all amounts
+        # Filter out extremely large amounts that might be totals or sums
+        all_amounts.sort(key=lambda x: x[0], reverse=True)
+        
+        if not all_amounts:
+            return None
+        
+        # Use median-based filtering to find reasonable net pay
+        values = [v for v, a in all_amounts]
+        if len(values) > 1:
+            median_value = sorted(values)[len(values) // 2]
+            
+            # Net pay should be within a reasonable range (not an extreme outlier)
+            # Typically net pay is between 1,000 and 50,000 for Zambian payslips
+            reasonable_amounts = [(v, a) for v, a in all_amounts if 1000 <= v <= 50000]
+            if reasonable_amounts:
+                # Return the largest reasonable amount
+                reasonable_amounts.sort(key=lambda x: x[0], reverse=True)
+                return self._normalize_amount(reasonable_amounts[0][1])
+            
+            # If no amounts in reasonable range, use median-based filtering
+            if all_amounts[0][0] < median_value * 10:
+                return self._normalize_amount(all_amounts[0][1])
+            
+            # Try second largest if first is too large
+            if len(all_amounts) > 1 and all_amounts[1][0] < median_value * 10:
+                return self._normalize_amount(all_amounts[1][1])
+        else:
+            # Only one amount, return it if valid
+            return self._normalize_amount(all_amounts[0][1])
+        
+        return None
     
     def _normalize_amount(self, amount: str) -> str:
         """Normalize amount format (keep commas for readability)"""
