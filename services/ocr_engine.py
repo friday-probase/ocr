@@ -6,11 +6,19 @@ import io
 import asyncio
 import time
 from typing import List, Dict, Any, Optional, Tuple
-from paddleocr import PaddleOCR
-from transformers import pipeline
-import torch
-from skimage import filters, morphology
-from skimage.restoration import denoise_bilateral
+# Conditionally import paddleocr and transformers (only if available)
+try:
+    from paddleocr import PaddleOCR
+except ImportError:
+    PaddleOCR = None
+
+try:
+    from transformers import pipeline
+    import torch
+except ImportError:
+    pipeline = None
+    torch = None
+
 from pdf2image import convert_from_bytes
 import tempfile
 import os
@@ -44,7 +52,7 @@ class OCREngine:
     
     async def initialize(self):
         """Initialize OCR engines"""
-        if self.paddle_ocr is None:
+        if self.paddle_ocr is None and PaddleOCR is not None:
             try:
                 import os
                 # Ensure environment variables are set before initializing PaddleOCR
@@ -66,9 +74,12 @@ class OCREngine:
             except Exception as e:
                 print(f"PaddleOCR initialization failed: {e}")
                 self.paddle_ocr = None
+        elif PaddleOCR is None:
+            # PaddleOCR module is not available
+            self.paddle_ocr = None
         
         # Initialize TrOCR with better error handling and options
-        if self.trocr_pipeline is None:
+        if self.trocr_pipeline is None and pipeline is not None and torch is not None:
             try:
                 import warnings
                 warnings.filterwarnings("ignore", message=".*You should probably TRAIN this model.*")
@@ -93,14 +104,21 @@ class OCREngine:
             except Exception as e:
                 print(f"TrOCR initialization failed: {e}")
                 self.trocr_pipeline = None
+        elif pipeline is None or torch is None:
+            # Transformers or torch modules are not available
+            self.trocr_pipeline = None
         
-        # Initialize additional AI models for better recognition
-        try:
-            # Attempt to initialize layoutlm for document understanding
-            from transformers import AutoTokenizer, VisionEncoderDecoderModel, AutoFeatureExtractor
-            # Use a lightweight model for layout analysis
-            self.layout_model = None  # Placeholder for future implementation
-        except ImportError:
+        # Initialize additional AI models for better recognition (only if transformers is available)
+        if pipeline is not None:
+            try:
+                # Attempt to initialize layoutlm for document understanding
+                import transformers
+                from transformers import AutoTokenizer, VisionEncoderDecoderModel, AutoFeatureExtractor
+                # Use a lightweight model for layout analysis
+                self.layout_model = None  # Placeholder for future implementation
+            except ImportError:
+                self.layout_model = None
+        else:
             self.layout_model = None
     
     async def extract_with_multiple_engines(
@@ -138,7 +156,7 @@ class OCREngine:
         
         # Engine 2: PaddleOCR (optional - can be slow)
         # Disabled by default due to initialization time, can be enabled for production
-        if self.paddle_ocr:
+        if self.paddle_ocr and PaddleOCR is not None:
             try:
                 paddle_result = await asyncio.wait_for(
                     self._run_paddle_ocr(cv_image, document_type),
@@ -150,7 +168,7 @@ class OCREngine:
         
         # Engine 3: TrOCR (AI-powered, optional) - only if enabled and available
         # Requires significant model download, disabled by default
-        if enable_ai and self.trocr_pipeline:
+        if enable_ai and self.trocr_pipeline and pipeline is not None:
             try:
                 trocr_result = await asyncio.wait_for(
                     self._run_trocr(pil_image, document_type),
@@ -222,6 +240,17 @@ class OCREngine:
         """Run PaddleOCR engine"""
         start_time = time.time()
         
+        # Check if PaddleOCR is available
+        if self.paddle_ocr is None or PaddleOCR is None:
+            print("PaddleOCR is not available")
+            return EngineResult(
+                engine_name="paddle_ocr",
+                text="",
+                confidence=0.0,
+                processing_time=0.0,
+                structured_data={}
+            )
+        
         try:
             result = self.paddle_ocr.ocr(image)
             
@@ -264,6 +293,17 @@ class OCREngine:
     async def _run_trocr(self, image: Image.Image, doc_type: str) -> EngineResult:
         """Run TrOCR AI model"""
         start_time = time.time()
+        
+        # Check if TrOCR is available
+        if self.trocr_pipeline is None or pipeline is None or torch is None:
+            print("TrOCR is not available")
+            return EngineResult(
+                engine_name="trocr",
+                text="",
+                confidence=0.0,
+                processing_time=0.0,
+                structured_data={}
+            )
         
         try:
             # Preprocess image for better TrOCR results
@@ -1212,20 +1252,44 @@ class OCREngine:
                 )
                 
                 # Process consensus for this page
-                from services.consensus_processor import ConsensusProcessor
-                consensus_processor = ConsensusProcessor()
-                consensus_result = await consensus_processor.process_consensus(
-                    engine_results, threshold=0.7  # Lower threshold for PDF processing
-                )
+                try:
+                    from services.consensus_processor import ConsensusProcessor
+                    consensus_processor = ConsensusProcessor()
+                    consensus_result = await consensus_processor.process_consensus(
+                        engine_results, threshold=0.7  # Lower threshold for PDF processing
+                    )
+                except Exception as e:
+                    print(f"Consensus processor error: {e}")
+                    # Fallback: use the first engine result if consensus fails
+                    if engine_results:
+                        first_result = engine_results[0]
+                        consensus_result = type('obj', (object,), {
+                            'text': first_result.text,
+                            'confidence': first_result.confidence,
+                            'engines_used': [first_result.engine_name],
+                            'structured_data': first_result.structured_data or {}
+                        })()
+                    else:
+                        consensus_result = type('obj', (object,), {
+                            'text': "",
+                            'confidence': 0.0,
+                            'engines_used': [],
+                            'structured_data': {}
+                        })()
                 
                 # Classify document type for this specific page if unknown
-                from services.document_classifier import DocumentClassifier
-                classifier = DocumentClassifier()
                 if document_type == "unknown":
-                    # Get text from OCR to classify this page
-                    temp_img = Image.open(io.BytesIO(img_bytes))
-                    classified_type = await classifier.classify(img_bytes)
-                    page_doc_type = classified_type.type
+                    try:
+                        from services.document_classifier import DocumentClassifier
+                        classifier = DocumentClassifier()
+                        # Get text from OCR to classify this page
+                        temp_img = Image.open(io.BytesIO(img_bytes))
+                        classified_type = await classifier.classify(img_bytes)
+                        page_doc_type = classified_type.type
+                    except Exception as e:
+                        print(f"Document classifier error: {e}")
+                        # Fallback to unknown if classification fails
+                        page_doc_type = "unknown"
                 else:
                     page_doc_type = document_type
                 
