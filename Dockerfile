@@ -1,97 +1,52 @@
-FROM python:3.10-slim
+# Stage 1: Build the Application
+# We use python:3.10-slim as the base for building and installing dependencies.
+FROM python:3.10-slim AS build
 
-# Install system dependencies for OCR and ML
-RUN apt-get update && apt-get install -y \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    libtesseract-dev \
-    libgl1-mesa-dev \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
-    libgthread-2.0-0 \
-    libgtk2.0-dev \
-    libavcodec-dev \
-    libavformat-dev \
-    libswscale-dev \
-    poppler-utils \
-    wget \
-    curl \
-    pkg-config \
-    python3-dev \
-    build-essential \
-    libffi-dev \
-    libssl-dev \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
+# Set the working directory inside the container
+WORKDIR /usr/src/app
 
-# Upgrade pip, setuptools, and wheel
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# Install system dependencies needed for building Python packages
+RUN apt-get update && apt-get install -y --no-install-recommends     build-essential     gcc     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app
+# Create a virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy requirements first
-COPY requirements.txt .
+# Copy requirements.txt if it exists (using wildcard to avoid build failure)
+COPY requirements.tx[t] ./requirements.txt
 
-# Install packages in stages to avoid conflicts
-# Stage 1: Core dependencies
-RUN pip install --no-cache-dir \
-    "numpy>=1.24.0,<2.0.0" \
-    "protobuf>=3.20.2,<4.0.0"
+# Install Python dependencies only if requirements.txt exists
+RUN pip install --upgrade pip &&     if [ -f requirements.txt ]; then         pip install -r requirements.txt;     fi
 
-# Stage 2: PyTorch (CPU version)
-RUN pip install --no-cache-dir \
-    torch==2.1.0 \
-    torchvision==0.16.0 \
-    --index-url https://download.pytorch.org/whl/cpu
-
-# Stage 3: Transformers and ML dependencies
-RUN pip install --no-cache-dir \
-    "transformers>=4.35.0,<4.40.0" \
-    "safetensors>=0.6.0"
-
-# Stage 4: Image processing
-RUN pip install --no-cache-dir \
-    "opencv-python-headless>=4.8.0" \
-    "scikit-image>=0.21.0" \
-    "pillow>=10.0.0"
-
-# Stage 5: OCR engines (most likely to fail)
-RUN pip install --no-cache-dir \
-    "paddlepaddle==2.5.2" || \
-    pip install --no-cache-dir "paddlepaddle==2.5.1" || \
-    pip install --no-cache-dir "paddlepaddle==2.5.0"
-
-RUN pip install --no-cache-dir "paddleocr>=2.7.0"
-
-# Stage 6: Remaining packages
-RUN pip install --no-cache-dir \
-    fastapi==0.104.1 \
-    uvicorn[standard]==0.24.0 \
-    python-multipart==0.0.6 \
-    pytesseract==0.3.10 \
-    requests==2.31.0 \
-    pydantic==2.5.0 \
-    python-dotenv==1.0.0 \
-    pdf2image>=1.17.0 \
-    aiofiles>=23.0.0
-
-# Create necessary directories
-RUN mkdir -p /app/uploads /app/temp /app/models
-
-# Copy application code
+# Copy the rest of the application source code
 COPY . .
 
-# Set environment variables
-ENV DISABLE_MODEL_SOURCE_CHECK=True
-ENV PYTHONUNBUFFERED=1
+# Stage 2: Create the Final Production Image
+# We use python:3.10-slim as a minimal runtime image.
+FROM python:3.10-slim
 
-# Expose port
-EXPOSE 8000
+# Set the working directory
+WORKDIR /usr/src/app
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Install only runtime dependencies if needed
+RUN apt-get update && apt-get install -y --no-install-recommends     libpq5     && rm -rf /var/lib/apt/lists/*
+
+# Copy the virtual environment from the build stage
+COPY --from=build /opt/venv /opt/venv
+
+# Copy the application code
+COPY --from=build /usr/src/app .
+
+# Set the virtual environment as the active Python environment
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Create a non-root user to run the application
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /usr/src/app
+USER appuser
+
+# Expose the port your app runs on
+ENV PORT=8080
+EXPOSE $PORT
+
+# Define the command to start your application
+CMD ["python", "app.py"]
