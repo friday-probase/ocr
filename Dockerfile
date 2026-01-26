@@ -24,7 +24,12 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libffi-dev \
     libssl-dev \
+    gcc \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip, setuptools, and wheel
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # Set working directory
 WORKDIR /app
@@ -32,14 +37,48 @@ WORKDIR /app
 # Copy requirements first
 COPY requirements.txt .
 
-# Install NumPy 1.x first to prevent NumPy 2.x installation
-RUN pip install --no-cache-dir "numpy>=1.24.0,<2.0.0"
+# Install packages in stages to avoid conflicts
+# Stage 1: Core dependencies
+RUN pip install --no-cache-dir \
+    "numpy>=1.24.0,<2.0.0" \
+    "protobuf>=3.20.2,<4.0.0"
 
-# Install PyTorch with CPU support
-RUN pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
+# Stage 2: PyTorch (CPU version)
+RUN pip install --no-cache-dir \
+    torch==2.1.0 \
+    torchvision==0.16.0 \
+    --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining Python packages
-RUN pip install --no-cache-dir -r requirements.txt
+# Stage 3: Transformers and ML dependencies
+RUN pip install --no-cache-dir \
+    "transformers>=4.35.0,<4.40.0" \
+    "safetensors>=0.6.0"
+
+# Stage 4: Image processing
+RUN pip install --no-cache-dir \
+    "opencv-python-headless>=4.8.0" \
+    "scikit-image>=0.21.0" \
+    "pillow>=10.0.0"
+
+# Stage 5: OCR engines (most likely to fail)
+RUN pip install --no-cache-dir \
+    "paddlepaddle==2.5.2" || \
+    pip install --no-cache-dir "paddlepaddle==2.5.1" || \
+    pip install --no-cache-dir "paddlepaddle==2.5.0"
+
+RUN pip install --no-cache-dir "paddleocr>=2.7.0"
+
+# Stage 6: Remaining packages
+RUN pip install --no-cache-dir \
+    fastapi==0.104.1 \
+    uvicorn[standard]==0.24.0 \
+    python-multipart==0.0.6 \
+    pytesseract==0.3.10 \
+    requests==2.31.0 \
+    pydantic==2.5.0 \
+    python-dotenv==1.0.0 \
+    pdf2image>=1.17.0 \
+    aiofiles>=23.0.0
 
 # Create necessary directories
 RUN mkdir -p /app/uploads /app/temp /app/models
@@ -47,11 +86,12 @@ RUN mkdir -p /app/uploads /app/temp /app/models
 # Copy application code
 COPY . .
 
-# Set environment variable to skip model connectivity checks
+# Set environment variables
 ENV DISABLE_MODEL_SOURCE_CHECK=True
+ENV PYTHONUNBUFFERED=1
 
 # Expose port
 EXPOSE 8000
 
-# Run the application with single worker initially for stability
+# Run the application
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
