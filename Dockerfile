@@ -26,14 +26,19 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch with CUDA support (if GPU available)
-RUN pip install torch==2.1.0+cpu torchvision==0.16.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
-
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python packages
+# Copy requirements first
 COPY requirements.txt .
+
+# Install NumPy 1.x first to prevent NumPy 2.x installation
+RUN pip install --no-cache-dir "numpy>=1.24.0,<2.0.0"
+
+# Install PyTorch with CPU support
+RUN pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
+
+# Install remaining Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Create necessary directories
@@ -42,8 +47,11 @@ RUN mkdir -p /app/uploads /app/temp /app/models
 # Copy application code
 COPY . .
 
+# Set environment variable to skip model connectivity checks
+ENV DISABLE_MODEL_SOURCE_CHECK=True
+
 # Expose port
 EXPOSE 8000
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Run the application with single worker initially for stability
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
