@@ -8,8 +8,8 @@ pydantic==2.5.0
 python-dotenv==1.0.0
 
 # Advanced OCR engines
+paddlepaddle>=2.6.2,<3.0
 paddleocr>=2.7.0
-paddlepaddle>=2.5.0
 transformers>=4.35.0,<4.45.0
 torch>=2.1.0
 torchvision>=0.16.0
