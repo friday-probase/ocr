@@ -1,5 +1,4 @@
 import pytesseract
-import cv2
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
 import io
@@ -130,9 +129,22 @@ class OCREngine:
         """Run multiple OCR engines and return results"""
         await self.initialize()
         
-        # Convert bytes to different formats
+        # Memory-efficient processing: Load and resize image if too large
         pil_image = Image.open(io.BytesIO(image_bytes))
-        cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        
+        # Limit image size to reduce memory usage
+        max_width, max_height = 1500, 1500
+        width, height = pil_image.size
+        if width > max_width or height > max_height:
+            ratio = min(max_width / width, max_height / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Convert PIL to numpy array for processing (grayscale)
+        if pil_image.mode != 'L':
+            pil_image = pil_image.convert('L')  # Convert to grayscale
+        cv_image = np.array(pil_image)
         
         # Store results
         results = []
@@ -185,6 +197,21 @@ class OCREngine:
         start_time = time.time()
         
         try:
+            # Convert numpy array back to PIL Image for size checking and potential resizing
+            pil_image = Image.fromarray(image)
+            
+            # Memory-efficient processing: resize very large images to reduce memory usage
+            max_width, max_height = 2000, 2000  # Limit to 2000x2000 pixels
+            width, height = pil_image.size
+            if width > max_width or height > max_height:
+                ratio = min(max_width / width, max_height / height)
+                new_width = int(width * ratio)
+                new_height = int(height * ratio)
+                pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Convert back to numpy array for processing
+            image = np.array(pil_image)
+            
             # Preprocess based on document type
             processed_image = self._preprocess_for_tesseract(image, doc_type)
             
@@ -371,80 +398,68 @@ class OCREngine:
         return image
     
     def _preprocess_for_tesseract(self, image: np.ndarray, doc_type: str) -> np.ndarray:
-        """Advanced preprocessing for scanned documents"""
-        # Convert to grayscale if needed
+        """Advanced preprocessing for scanned documents using Pillow"""
+        # Convert numpy array to PIL Image
         if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            pil_image = Image.fromarray(image)
         else:
-            gray = image
+            # Grayscale image
+            pil_image = Image.fromarray(image)
         
-        # Apply advanced preprocessing for scanned documents
-        gray = self._enhance_scanned_image(gray, doc_type)
+        # Convert to grayscale if needed
+        if pil_image.mode != 'L':
+            pil_image = pil_image.convert('L')
+        
+        # Apply advanced preprocessing for scanned documents using Pillow
+        pil_image = self._enhance_scanned_image_pil(pil_image, doc_type)
         
         # Apply document-type specific preprocessing
         if doc_type == "payslip":
-            gray = self._preprocess_payslip(gray)
+            pil_image = self._preprocess_payslip_pil(pil_image)
         elif doc_type == "id_document":
-            gray = self._preprocess_id_document(gray)
+            pil_image = self._preprocess_id_document_pil(pil_image)
         elif doc_type == "invoice":
-            gray = self._preprocess_invoice(gray)
+            pil_image = self._preprocess_invoice_pil(pil_image)
         else:
-            gray = self._preprocess_general(gray)
+            pil_image = self._preprocess_general_pil(pil_image)
         
-        return gray
+        # Convert back to numpy array
+        return np.array(pil_image)
     
-    def _enhance_scanned_image(self, image: np.ndarray, doc_type: str) -> np.ndarray:
-        """Enhance scanned image quality"""
-        # Convert to float for better precision
-        image_float = image.astype(np.float32)
+    def _enhance_scanned_image_pil(self, image: Image.Image, doc_type: str) -> Image.Image:
+        """Enhance scanned image quality using Pillow"""
+        # Convert to 'L' mode if not already
+        if image.mode != 'L':
+            image = image.convert('L')
         
-        # Denoise using bilateral filter (preserves edges while removing noise)
-        image = cv2.bilateralFilter(image, 9, 75, 75)
+        # Enhance contrast
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.5)
         
-        # Contrast enhancement using CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        image = clahe.apply(image)
+        # Enhance sharpness
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(1.5)
         
-        # Apply unsharp mask to enhance text
-        gaussian_blur = cv2.GaussianBlur(image, (0, 0), 2.0)
-        image = cv2.addWeighted(image, 1.5, gaussian_blur, -0.5, 0)
+        # Apply slight blur to reduce noise
+        image = image.filter(ImageFilter.SMOOTH)
         
-        # Thresholding with Otsu's method for better binarization
-        _, image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Morphological operations to clean up
-        kernel = np.ones((2, 2), np.uint8)
-        image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
-        image = cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel)
-        
-        # Additional noise removal
-        kernel = np.ones((1, 1), np.uint8)
-        image = cv2.morphologyEx(image, cv2.MORPH_ERODE, kernel)
+        # Apply edge enhancement
+        image = image.filter(ImageFilter.EDGE_ENHANCE_MORE)
         
         return image
     
-    def _preprocess_payslip(self, image: np.ndarray) -> np.ndarray:
-        """Specialized preprocessing for payslips"""
+    def _preprocess_payslip_pil(self, image: Image.Image) -> Image.Image:
+        """Specialized preprocessing for payslips using Pillow"""
         # Payslips often have tables and small text
         # Enhance contrast and sharpness
-        image = cv2.convertScaleAbs(image, alpha=1.7, beta=15)
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.7)
         
-        # Apply Gaussian blur followed by unsharp masking
-        blurred = cv2.GaussianBlur(image, (0, 0), 3.0)
-        image = cv2.addWeighted(image, 1.8, blurred, -0.8, 0)
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(1.8)
         
-        # Enhance horizontal and vertical lines (tables)
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
-        
-        horizontal_lines = cv2.morphologyEx(image, cv2.MORPH_OPEN, horizontal_kernel)
-        vertical_lines = cv2.morphologyEx(image, cv2.MORPH_OPEN, vertical_kernel)
-        
-        # Combine the lines to preserve table structure
-        table_lines = cv2.addWeighted(horizontal_lines, 0.5, vertical_lines, 0.5, 0)
-        
-        # Add the lines back to the original image
-        image = cv2.addWeighted(image, 1.0, table_lines, 0.1, 0)
+        # Apply slight smoothing to reduce noise while preserving text
+        image = image.filter(ImageFilter.SMOOTH)
         
         return image
     
@@ -459,39 +474,51 @@ class OCREngine:
         kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
         image = cv2.filter2D(image, -1, kernel)
         
-        # Reduce noise while preserving text
-        image = cv2.fastNlMeansDenoising(image, None, 10, 7, 21)
+        # Apply smoothing to reduce noise while preserving text
+        image = image.filter(ImageFilter.SMOOTH)
         
         return image
     
-    def _preprocess_invoice(self, image: np.ndarray) -> np.ndarray:
-        """Specialized preprocessing for invoices"""
+    def _preprocess_id_document_pil(self, image: Image.Image) -> Image.Image:
+        """Specialized preprocessing for ID documents using Pillow"""
+        # IDs often have photos and small text - enhance both
+        # Enhance contrast using histogram equalization equivalent
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.3)
+        
+        # Enhance edges for text readability
+        image = image.filter(ImageFilter.EDGE_ENHANCE)
+        
+        # Reduce noise while preserving text
+        image = image.filter(ImageFilter.SMOOTH)
+        
+        return image
+    
+    def _preprocess_invoice_pil(self, image: Image.Image) -> Image.Image:
+        """Specialized preprocessing for invoices using Pillow"""
         # Invoices often have structured layouts and monetary values
-        # Enhance contrast using histogram equalization
-        image = cv2.equalizeHist(image)
+        # Enhance contrast
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.3)
         
         # Enhance text sharpness
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-        image = cv2.filter2D(image, -1, kernel)
-        
-        # Preserve table structure
-        rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 3))
-        image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, rect_kernel)
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(1.5)
         
         return image
     
-    def _preprocess_general(self, image: np.ndarray) -> np.ndarray:
-        """General preprocessing for unknown document types"""
+    def _preprocess_general_pil(self, image: Image.Image) -> Image.Image:
+        """General preprocessing for unknown document types using Pillow"""
         # Apply adaptive contrast enhancement
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        image = clahe.apply(image)
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.3)
         
-        # Apply bilateral filter for noise reduction while keeping edges sharp
-        image = cv2.bilateralFilter(image, 9, 75, 75)
+        # Apply smoothing for noise reduction while keeping edges relatively sharp
+        image = image.filter(ImageFilter.SMOOTH)
         
         # Slight sharpening
-        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        image = cv2.filter2D(image, -1, kernel)
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(1.2)
         
         return image
     
@@ -1232,12 +1259,22 @@ class OCREngine:
         start_time = time.time()
         
         try:
-            # Convert PDF pages to images with better quality settings
-            images = convert_from_bytes(pdf_bytes, dpi=300, fmt='PNG', thread_count=2)
+            # Convert PDF pages to images with memory-efficient settings
+            # Use lower DPI to reduce memory usage
+            images = convert_from_bytes(pdf_bytes, dpi=150, fmt='PNG', thread_count=1)
             
             page_results = []
             
             for page_num, image in enumerate(images, 1):
+                # Memory-efficient processing: resize large images
+                max_width, max_height = 1500, 1500  # Further limit to reduce memory
+                width, height = image.size
+                if width > max_width or height > max_height:
+                    ratio = min(max_width / width, max_height / height)
+                    new_width = int(width * ratio)
+                    new_height = int(height * ratio)
+                    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                
                 # Convert PIL image to bytes
                 img_byte_arr = io.BytesIO()
                 image.save(img_byte_arr, format='PNG')

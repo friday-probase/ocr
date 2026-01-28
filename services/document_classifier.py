@@ -4,7 +4,6 @@ try:
 except ImportError:
     pipeline = None
 
-import cv2
 import numpy as np
 from PIL import Image
 import io
@@ -164,12 +163,11 @@ class DocumentClassifier:
                 from PIL import Image
                 import io
                 
-                # Convert PIL image to numpy array
-                img_array = np.array(image)
-                if len(img_array.shape) == 3:
-                    img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                # Convert PIL image to grayscale using PIL
+                if image.mode != 'L':
+                    img_gray = image.convert('L')
                 else:
-                    img_gray = img_array
+                    img_gray = image
                 
                 # Extract text
                 text = pytesseract.image_to_string(img_gray).lower()
@@ -204,12 +202,15 @@ class DocumentClassifier:
         try:
             import pytesseract
             
-            # Convert to numpy array for OpenCV
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            image_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            # Convert image bytes to PIL Image
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            
+            # Convert to grayscale for OCR
+            if pil_image.mode != 'L':
+                pil_image = pil_image.convert('L')
             
             # Extract text for keyword analysis
-            text = pytesseract.image_to_string(image_cv).lower()
+            text = pytesseract.image_to_string(pil_image).lower()
             
             # Score each document type based on keyword matches with weighted scoring
             scores = {}
