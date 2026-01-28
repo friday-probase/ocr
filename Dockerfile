@@ -25,10 +25,9 @@ COPY . .
 # Create directories
 RUN mkdir -p /app/uploads /app/temp
 
-# Environment
+# Environment - Railway sets PORT dynamically
 ENV PYTHONUNBUFFERED=1
-ENV PORT=8000
+ENV DISABLE_MODEL_SOURCE_CHECK=True
 
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Use shell form to allow $PORT variable expansion
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1
