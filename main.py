@@ -12,7 +12,9 @@ import time
 from services.ocr_engine import OCREngine
 from services.document_classifier import DocumentClassifier
 from services.consensus_processor import ConsensusProcessor
+from services.extract_payslip_llm import extract_payslip_llm
 from models.response_models import OCRResponse, DocumentType, ProcessingRequest, BatchProcessRequest, BatchProcessResponse, PDFResponse, PageResult
+
 
 app = FastAPI(
     title="AI OCR Service",
@@ -129,6 +131,61 @@ async def extract_text(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
+
+
+class PayslipResponse(BaseModel):
+    """Response model for payslip extraction"""
+    success: bool
+    net_pay: Optional[float] = None
+    net_pay_formatted: Optional[str] = None
+    currency: Optional[str] = None
+    employee_name: Optional[str] = None
+    pay_period: Optional[str] = None
+    confidence: float
+    processing_time: float
+    errors: List[str] = []
+
+
+@app.post("/extract-payslip", response_model=PayslipResponse)
+async def extract_payslip(
+    file: UploadFile = File(...)
+):
+    """
+    Extract net pay from payslip using LLM-based extraction.
+    Supports PNG, JPG, JPEG, and PDF files.
+    Lightweight endpoint using Ollama for intelligent extraction.
+    """
+    # Validate file type
+    allowed_types = ['image/png', 'image/jpeg', 'image/jpg', 'application/pdf']
+    if file.content_type not in allowed_types and not file.content_type.startswith('image/'):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"File must be an image or PDF. Got: {file.content_type}"
+        )
+    
+    try:
+        file_bytes = await file.read()
+        
+        # Use LLM-based extraction
+        result = extract_payslip_llm(file_bytes=file_bytes)
+        
+        # Build response
+        data = result.get('data', {})
+        
+        return PayslipResponse(
+            success=result['success'],
+            net_pay=data.get('net_pay'),
+            net_pay_formatted=data.get('net_pay_formatted'),
+            currency=data.get('currency'),
+            employee_name=data.get('employee_name'),
+            pay_period=data.get('pay_period'),
+            confidence=result['confidence'],
+            processing_time=result['processing_time_seconds'],
+            errors=result['errors']
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Payslip extraction failed: {str(e)}")
 
 @app.post("/extract-pdf", response_model=PDFResponse)
 async def extract_pdf_text(
